@@ -1,12 +1,25 @@
 use eframe::egui;
-use egui::ScrollArea;
+use egui::{ColorImage, ScrollArea};
 use reqwest::Client;
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::process::{Child, Command};
 use std::sync::mpsc;
 use std::thread;
 use urlencoding::encode;
+
+type VideoKey = (i64, i64);
+type ThumbMsg = (VideoKey, Result<ColorImage, ()>);
+
+const THUMB_W: f32 = 128.0;
+const THUMB_H: f32 = 72.0;
+
+#[derive(Deserialize, Debug, Clone)]
+struct ImagePreview {
+    url: String,
+    width: Option<u32>,
+}
 
 #[derive(Deserialize, Debug, Clone)]
 struct VideoItem {
@@ -14,6 +27,27 @@ struct VideoItem {
     id: i64,
     title: String,
     duration: Option<i32>,
+    image: Option<Vec<ImagePreview>>,
+}
+
+impl VideoItem {
+    fn key(&self) -> VideoKey {
+        (self.owner_id, self.id)
+    }
+
+    /// Выбираем превью с шириной, ближайшей к 320px — быстро качается и декодируется
+    fn thumbnail(&self) -> Option<String> {
+        let imgs = self.image.as_ref()?;
+        let best = imgs.iter().min_by_key(|i| {
+            let w = i.width.unwrap_or(0) as i32;
+            (w - 320).abs()
+        })?;
+        let mut url = best.url.clone();
+        if url.starts_with("//") {
+            url = format!("https:{}", url);
+        }
+        Some(url)
+    }
 }
 
 #[derive(Deserialize)]
@@ -49,6 +83,12 @@ struct VkVideoApp {
     clicked_video: Option<VideoItem>,
     clicked_download: Option<VideoItem>,
     search_rx: Option<mpsc::Receiver<Result<Vec<VideoItem>, String>>>,
+    // Кэш превью
+    thumbnails: HashMap<VideoKey, egui::TextureHandle>,
+    pending: HashSet<VideoKey>,
+    failed: HashSet<VideoKey>,
+    thumb_tx: mpsc::Sender<ThumbMsg>,
+    thumb_rx: mpsc::Receiver<ThumbMsg>,
 }
 
 impl VkVideoApp {
@@ -57,6 +97,8 @@ impl VkVideoApp {
             .unwrap_or_default()
             .trim()
             .to_string();
+
+        let (thumb_tx, thumb_rx) = mpsc::channel();
 
         Self {
             token,
@@ -69,6 +111,11 @@ impl VkVideoApp {
             clicked_video: None,
             clicked_download: None,
             search_rx: None,
+            thumbnails: HashMap::new(),
+            pending: HashSet::new(),
+            failed: HashSet::new(),
+            thumb_tx,
+            thumb_rx,
         }
     }
 
@@ -129,7 +176,51 @@ impl VkVideoApp {
         }
     }
 
-    /// Запускает mpv как внешний процесс. mpv сам вытащит стрим через встроенный yt-dlp.
+    /// Запускает фоновую загрузку+декодирование превью (не трогает UI-поток)
+    fn request_thumbnails(&mut self, videos: &[VideoItem]) {
+        for video in videos {
+            let key = video.key();
+            if self.thumbnails.contains_key(&key)
+                || self.pending.contains(&key)
+                || self.failed.contains(&key)
+            {
+                continue;
+            }
+            let Some(url) = video.thumbnail() else {
+                continue;
+            };
+
+            self.pending.insert(key);
+            let tx = self.thumb_tx.clone();
+
+            thread::spawn(move || {
+                let result = (|| -> Result<ColorImage, ()> {
+                    let client = reqwest::blocking::Client::new();
+                    let bytes = client
+                        .get(&url)
+                        .send()
+                        .map_err(|_| ())?
+                        .bytes()
+                        .map_err(|_| ())?;
+
+                    // Декодируем и уменьшаем В ФОНЕ — UI об этом даже не узнает
+                    let img = image::load_from_memory(&bytes).map_err(|_| ())?;
+                    let img = img
+                        .resize(256, 144, image::imageops::FilterType::Triangle)
+                        .into_rgba8();
+
+                    let (w, h) = img.dimensions();
+                    Ok(ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        img.as_raw(),
+                    ))
+                })();
+
+                let _ = tx.send((key, result));
+            });
+        }
+    }
+
     fn play_video(&mut self, video: VideoItem) {
         let vk_url = format!("https://vkvideo.ru/video{}_{}", video.owner_id, video.id);
 
@@ -189,16 +280,68 @@ impl VkVideoApp {
         }
         self.state = AppState::Search;
     }
+
+    /// Скелетон-плейсхолдер: фиксированный слот с пульсацией
+    fn draw_skeleton(ui: &mut egui::Ui) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(THUMB_W, THUMB_H), egui::Sense::hover());
+        let t = ui.input(|i| i.time);
+        let pulse = 0.5 + 0.5 * (t * 3.0).sin();
+        let gray = (35.0 + 15.0 * pulse) as u8;
+        ui.painter().rect_filled(
+            rect,
+            egui::Rounding::same(6.0),
+            egui::Color32::from_gray(gray),
+        );
+        // Просим перерисовку, пока скелетон виден (анимация)
+        ui.ctx().request_repaint();
+    }
+
+    /// Статичный плейсхолдер при ошибке загрузки
+    fn draw_failed(ui: &mut egui::Ui) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(THUMB_W, THUMB_H), egui::Sense::hover());
+        ui.painter().rect_filled(
+            rect,
+            egui::Rounding::same(6.0),
+            egui::Color32::from_gray(40),
+        );
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "📺",
+            egui::FontId::proportional(24.0),
+            egui::Color32::from_gray(120),
+        );
+    }
 }
 
 impl eframe::App for VkVideoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Опрашиваем канал поиска
+        // 1. Принимаем готовые превью из фоновых потоков
+        while let Ok((key, res)) = self.thumb_rx.try_recv() {
+            self.pending.remove(&key);
+            match res {
+                Ok(color_image) => {
+                    let handle = ctx.load_texture(
+                        format!("thumb_{}_{}", key.0, key.1),
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.thumbnails.insert(key, handle);
+                }
+                Err(()) => {
+                    self.failed.insert(key);
+                }
+            }
+        }
+
+        // 2. Опрашиваем канал поиска
         if let Some(rx) = self.search_rx.take() {
             match rx.try_recv() {
                 Ok(Ok(videos)) => {
+                    let vids = videos.clone();
                     self.videos = videos;
                     self.is_searching = false;
+                    self.request_thumbnails(&vids);
                 }
                 Ok(Err(e)) => {
                     self.error_message = Some(e);
@@ -213,7 +356,7 @@ impl eframe::App for VkVideoApp {
             }
         }
 
-        // Если окно mpv закрыли — возвращаемся в режим поиска
+        // 3. Если окно mpv закрыли — возвращаемся к списку
         let mpv_finished = matches!(
             self.mpv_child.as_mut().map(|c| c.try_wait()),
             Some(Ok(Some(_)))
@@ -264,24 +407,46 @@ impl eframe::App for VkVideoApp {
                         .max_height(ui.available_height() - 100.0)
                         .show(ui, |ui| {
                             for video in &videos_clone {
-                                ui.horizontal(|ui| {
-                                    ui.label("📺");
+                                let key = video.key();
+                                let handle = self.thumbnails.get(&key).cloned();
 
-                                    let mut title = video.title.clone();
-                                    if let Some(duration) = video.duration {
-                                        let mins = duration / 60;
-                                        let secs = duration % 60;
-                                        title = format!("{} ({}:{:02})", title, mins, secs);
+                                ui.horizontal_top(|ui| {
+                                    // Слот превью ВСЕГДА одного размера — интерфейс не прыгает
+                                    if let Some(handle) = handle {
+                                        let sized = egui::load::SizedTexture::new(
+                                            handle.id(),
+                                            egui::vec2(THUMB_W, THUMB_H),
+                                        );
+                                        ui.add(
+                                            egui::Image::new(sized)
+                                                .rounding(egui::Rounding::same(6.0)),
+                                        );
+                                    } else if self.failed.contains(&key) {
+                                        Self::draw_failed(ui);
+                                    } else {
+                                        Self::draw_skeleton(ui);
                                     }
 
-                                    if ui.button(&title).clicked() {
-                                        self.clicked_video = Some(video.clone());
-                                    }
+                                    ui.vertical(|ui| {
+                                        let mut title = video.title.clone();
+                                        if let Some(duration) = video.duration {
+                                            let mins = duration / 60;
+                                            let secs = duration % 60;
+                                            title = format!("{} ({}:{:02})", title, mins, secs);
+                                        }
 
-                                    if ui.button("💾 Скачать").clicked() {
-                                        self.clicked_download = Some(video.clone());
-                                    }
+                                        if ui.button(&title).clicked() {
+                                            self.clicked_video = Some(video.clone());
+                                        }
+
+                                        if ui.button("💾 Скачать").clicked() {
+                                            self.clicked_download = Some(video.clone());
+                                        }
+                                    });
                                 });
+
+                                ui.add_space(6.0);
+                                ui.separator();
                             }
                         });
 
@@ -310,8 +475,8 @@ impl eframe::App for VkVideoApp {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([800.0, 600.0])
-            .with_min_inner_size([400.0, 300.0]),
+            .with_inner_size([900.0, 700.0])
+            .with_min_inner_size([500.0, 400.0]),
         ..Default::default()
     };
 
