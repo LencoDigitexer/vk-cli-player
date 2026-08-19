@@ -223,6 +223,13 @@ impl eframe::App for VkVideoApp {
         egui::CentralPanel::default()
             .frame(ui::theme::panel_frame(16.0))
             .show(ctx, |ui| {
+                // Фон central panel с разделителем
+                ui.painter().rect_filled(
+                    ui.max_rect(),
+                    egui::Rounding::same(0.0),
+                    ui::theme::BG_PRIMARY,
+                );
+                
                 if let Some(c) = ui::feed::chips(ui, &self.chip) {
                     self.chip = c.clone();
                     if c == "Все" {
